@@ -1,6 +1,7 @@
 import os
 import time
 import pdb
+import re
 
 import gradio as gr
 import spaces
@@ -9,6 +10,7 @@ import sys
 import subprocess
 
 from huggingface_hub import snapshot_download
+import requests
 
 import argparse
 import os
@@ -21,21 +23,22 @@ import pickle
 from tqdm import tqdm
 import copy
 from argparse import Namespace
-
-from musetalk.utils.utils import get_file_type,get_video_fps,datagen
-from musetalk.utils.preprocessing import get_landmark_and_bbox,read_imgs,coord_placeholder
-from musetalk.utils.blending import get_image
-from musetalk.utils.utils import load_all_model
 import shutil
-
-
+import gdown
+import imageio
 
 ProjectDir = os.path.abspath(os.path.dirname(__file__))
-CheckpointsDir = os.path.join(ProjectDir, "checkpoints")
+CheckpointsDir = os.path.join(ProjectDir, "models")
+
+def print_directory_contents(path):
+    for child in os.listdir(path):
+        child_path = os.path.join(path, child)
+        if os.path.isdir(child_path):
+            print(child_path)
 
 def download_model():
     if not os.path.exists(CheckpointsDir):
-        os.path.makedirs()
+        os.makedirs(CheckpointsDir)
         print("Checkpoint Not Downloaded, start downloading...")
         tic = time.time()
         snapshot_download(
@@ -44,15 +47,83 @@ def download_model():
             max_workers=8,
             local_dir_use_symlinks=True,
         )
+        # weight
+        os.makedirs(f"{CheckpointsDir}/sd-vae-ft-mse/")
+        snapshot_download(
+            repo_id="stabilityai/sd-vae-ft-mse",
+            local_dir=CheckpointsDir+'/sd-vae-ft-mse',
+            max_workers=8,
+            local_dir_use_symlinks=True,
+        )
+        #dwpose
+        os.makedirs(f"{CheckpointsDir}/dwpose/")
+        snapshot_download(
+            repo_id="yzd-v/DWPose",
+            local_dir=CheckpointsDir+'/dwpose',
+            max_workers=8,
+            local_dir_use_symlinks=True,
+        )
+        #vae
+        url = "https://openaipublic.azureedge.net/main/whisper/models/65147644a518d12f04e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9/tiny.pt"
+        response = requests.get(url)
+        # 确保请求成功
+        if response.status_code == 200:
+            # 指定文件保存的位置
+            file_path = f"{CheckpointsDir}/whisper/tiny.pt"
+            os.makedirs(f"{CheckpointsDir}/whisper/")
+            # 将文件内容写入指定位置
+            with open(file_path, "wb") as f:
+                f.write(response.content)
+        else:
+            print(f"请求失败，状态码：{response.status_code}")
+        #gdown face parse
+        url = "https://drive.google.com/uc?id=154JgKpzCPW82qINcVieuPH3fZ2e0P812"
+        os.makedirs(f"{CheckpointsDir}/face-parse-bisent/")
+        file_path = f"{CheckpointsDir}/face-parse-bisent/79999_iter.pth"
+        gdown.download(url, file_path, quiet=False)
+        #resnet
+        url = "https://download.pytorch.org/models/resnet18-5c106cde.pth"
+        response = requests.get(url)
+        # 确保请求成功
+        if response.status_code == 200:
+            # 指定文件保存的位置
+            file_path = f"{CheckpointsDir}/face-parse-bisent/resnet18-5c106cde.pth"
+            # 将文件内容写入指定位置
+            with open(file_path, "wb") as f:
+                f.write(response.content)
+        else:
+            print(f"请求失败，状态码：{response.status_code}")
+
+
         toc = time.time()
+
         print(f"download cost {toc-tic} seconds")
+        print_directory_contents(CheckpointsDir)
+
     else:
         print("Already download the model.")
 
 
+
+
+
+download_model()  # for huggingface deployment.
+
+
+from musetalk.utils.utils import get_file_type,get_video_fps,datagen
+from musetalk.utils.preprocessing import get_landmark_and_bbox,read_imgs,coord_placeholder,get_bbox_range
+from musetalk.utils.blending import get_image
+from musetalk.utils.utils import load_all_model
+
+
+
+
+
+
+@spaces.GPU(duration=600)
 @torch.no_grad()
-def inference(audio_path,video_path,bbox_shift):
-    args_dict={"result_dir":'./results', "fps":25, "batch_size":8, "output_vid_name":'', "use_saved_coord":False}#same with inferenece script
+def inference(audio_path,video_path,bbox_shift,progress=gr.Progress(track_tqdm=True)):
+    args_dict={"result_dir":'./results/output', "fps":25, "batch_size":8, "output_vid_name":'', "use_saved_coord":False}#same with inferenece script
     args = Namespace(**args_dict)
 
     input_basename = os.path.basename(video_path).split('.')[0]
@@ -70,8 +141,14 @@ def inference(audio_path,video_path,bbox_shift):
     if get_file_type(video_path)=="video":
         save_dir_full = os.path.join(args.result_dir, input_basename)
         os.makedirs(save_dir_full,exist_ok = True)
-        cmd = f"ffmpeg -v fatal -i {video_path} -start_number 0 {save_dir_full}/%08d.png"
-        os.system(cmd)
+        # cmd = f"ffmpeg -v fatal -i {video_path} -start_number 0 {save_dir_full}/%08d.png"
+        # os.system(cmd)
+        # 读取视频
+        reader = imageio.get_reader(video_path)
+
+        # 保存图片
+        for i, im in enumerate(reader):
+            imageio.imwrite(f"{save_dir_full}/{i:08d}.png", im)
         input_img_list = sorted(glob.glob(os.path.join(save_dir_full, '*.[jpJP][pnPN]*[gG]')))
         fps = get_video_fps(video_path)
     else: # input img folder
@@ -93,7 +170,7 @@ def inference(audio_path,video_path,bbox_shift):
         coord_list, frame_list = get_landmark_and_bbox(input_img_list, bbox_shift)
         with open(crop_coord_save_path, 'wb') as f:
             pickle.dump(coord_list, f)
-            
+    bbox_shift_text=get_bbox_range(input_img_list, bbox_shift)
     i = 0
     input_latent_list = []
     for bbox, frame in zip(coord_list, frame_list):
@@ -141,19 +218,54 @@ def inference(audio_path,video_path,bbox_shift):
         combine_frame = get_image(ori_frame,res_frame,bbox)
         cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png",combine_frame)
         
-    cmd_img2video = f"ffmpeg -y -v fatal -r {fps} -f image2 -i {result_img_save_path}/%08d.png -vcodec libx264 -vf format=rgb24,scale=out_color_matrix=bt709,format=yuv420p -crf 18 temp.mp4"
-    print(cmd_img2video)
-    os.system(cmd_img2video)
+    # cmd_img2video = f"ffmpeg -y -v fatal -r {fps} -f image2 -i {result_img_save_path}/%08d.png -vcodec libx264 -vf format=rgb24,scale=out_color_matrix=bt709,format=yuv420p temp.mp4"
+    # print(cmd_img2video)
+    # os.system(cmd_img2video)
+    # 帧率
+    fps = 25
+    # 图片路径
+    # 输出视频路径
+    output_video = 'temp.mp4'
 
-    cmd_combine_audio = f"ffmpeg -y -v fatal -i {audio_path} -i temp.mp4 {output_vid_name}"
-    print(cmd_combine_audio)
-    os.system(cmd_combine_audio)
+    # 读取图片
+    def is_valid_image(file):
+        pattern = re.compile(r'\d{8}\.png')
+        return pattern.match(file)
+
+    images = []
+    files = [file for file in os.listdir(result_img_save_path) if is_valid_image(file)]
+    files.sort(key=lambda x: int(x.split('.')[0]))
+
+    for file in files:
+        filename = os.path.join(result_img_save_path, file)
+        images.append(imageio.imread(filename))
+        
+
+    # 保存视频
+    imageio.mimwrite(output_video, images, 'FFMPEG', fps=fps, codec='libx264', pixelformat='yuv420p')
+
+
+    # cmd_combine_audio = f"ffmpeg -y -v fatal -i {audio_path} -i temp.mp4 {output_vid_name}"
+    # print(cmd_combine_audio)
+    # os.system(cmd_combine_audio)
+
+    input_video = 'temp.mp4'
+
+    # 读取视频
+    reader = imageio.get_reader(input_video)
+    fps = reader.get_meta_data()['fps']  # 获取原视频的帧率
+
+    # 将帧存储在列表中
+    frames = [im for im in reader]
+
+    # 保存视频并添加音频
+    imageio.mimwrite(output_vid_name, frames, 'FFMPEG', fps=fps, codec='libx264', audio_codec='aac', input_params=['-i', audio_path])
 
     os.remove("temp.mp4")
     shutil.rmtree(result_img_save_path)
     print(f"result is save to {output_vid_name}")
+    return output_vid_name,bbox_shift_text
 
-download_model()  # for huggingface deployment.
 
 
 # load model weights
@@ -165,6 +277,8 @@ timesteps = torch.tensor([0], device=device)
 
 
 def check_video(video):
+    if not isinstance(video, str):
+        return video # in case of none type
     # Define the output video file name
     dir_path, file_name = os.path.split(video)
     if file_name.startswith("outputxxx_"):
@@ -172,13 +286,26 @@ def check_video(video):
     # Add the output prefix to the file name
     output_file_name = "outputxxx_" + file_name
 
+    os.makedirs('./results',exist_ok=True)
+    os.makedirs('./results/output',exist_ok=True)
+    os.makedirs('./results/input',exist_ok=True)
+
     # Combine the directory path and the new file name
-    output_video = os.path.join(dir_path, output_file_name)
+    output_video = os.path.join('./results/input', output_file_name)
 
 
-    # Run the ffmpeg command to change the frame rate to 25fps
-    command = f"ffmpeg -i {video} -r 25 {output_video}"
-    subprocess.run(command, shell=True, check=True)
+    # # Run the ffmpeg command to change the frame rate to 25fps
+    # command = f"ffmpeg -i {video} -r 25 -vcodec libx264 -vtag hvc1 -pix_fmt yuv420p crf 18   {output_video}  -y"
+
+    # 读取视频
+    reader = imageio.get_reader(video)
+    fps = reader.get_meta_data()['fps']  # 获取原视频的帧率
+
+    # 将帧存储在列表中
+    frames = [im for im in reader]
+
+    # 保存视频
+    imageio.mimwrite(output_video, frames, 'FFMPEG', fps=25, codec='libx264', quality=9, pixelformat='yuv420p')
     return output_video
 
 
@@ -210,8 +337,10 @@ with gr.Blocks(css=css) as demo:
     with gr.Row():
         with gr.Column():
             audio = gr.Audio(label="Driven Audio",type="filepath")
-            video = gr.Video(label="Reference Video")
-            bbox_shift = gr.Number(label="BBox_shift,[-9,9]", value=-1)
+            video = gr.Video(label="Reference Video",sources=['upload'])
+            bbox_shift = gr.Number(label="BBox_shift value, px", value=0)
+            bbox_shift_scale = gr.Textbox(label="BBox_shift recommend value lower bound,The corresponding bbox range is generated after the initial result is generated. \n If the result is not good, it can be adjusted according to this reference value", value="",interactive=False)
+
             btn = gr.Button("Generate")
         out1 = gr.Video()
     
@@ -225,7 +354,7 @@ with gr.Blocks(css=css) as demo:
             video,
             bbox_shift,
         ],
-        outputs=out1,
+        outputs=[out1,bbox_shift_scale]
     )
 
 # Set the IP and port
